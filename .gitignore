@@ -130,3 +130,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+/raw_scans
+/desampled_scans
+/aligned_scans
+/pre-rotated_scans
