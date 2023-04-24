@@ -181,6 +181,74 @@ def icp_registration_with_two_spheres(model1, model2,
 
     return transformation_matrix, cost
 
+import open3d as o3d
+
+def preprocess_point_cloud(point_cloud, voxel_size):
+    """
+    Preprocesses the point cloud by downsampling and computing normals and FPFH features.
+    """
+    # Downsample the point cloud
+    point_cloud_downsampled = point_cloud.voxel_down_sample(voxel_size)
+
+    # Estimate normals
+    radius_normal = voxel_size * 2
+    point_cloud_downsampled.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+
+    # Compute FPFH features
+    radius_feature = voxel_size * 5
+    fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        point_cloud_downsampled,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+    return point_cloud_downsampled, fpfh
+
+def ransac_icp_registration(source, target, voxel_size=0.05, distance_threshold=0.1):
+    """
+    Performs initial alignment using RANSAC and refines it with ICP.
+
+    Args:
+        source (trimesh.Trimesh): The source mesh.
+        target (trimesh.Trimesh): The target mesh.
+        voxel_size (float): The size of voxels used for downsampling.
+        distance_threshold (float): Maximum distance for RANSAC correspondences.
+
+    Returns:
+        trimesh.Trimesh: The transformed source mesh.
+    """
+    # Convert Trimesh objects to Open3D PointCloud objects
+    source_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(source.vertices))
+    target_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(target.vertices))
+
+    # Preprocess the point clouds and extract features
+    source_downsampled, source_fpfh = preprocess_point_cloud(source_o3d, voxel_size)
+    target_downsampled, target_fpfh = preprocess_point_cloud(target_o3d, voxel_size)
+
+    # Perform initial alignment using RANSAC
+    transformation_init = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        source_downsampled, target_downsampled, source_fpfh, target_fpfh, True, distance_threshold,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(False), 4,
+        [o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+         o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold)]
+    ).transformation
+
+    # Refine the alignment using ICP
+    transformation_icp = o3d.pipelines.registration.registration_icp(
+        source_o3d, target_o3d, distance_threshold, transformation_init,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint()
+    ).transformation
+
+    # Apply the transformation to the source mesh and return the result
+    source_transformed = source.copy()
+    source_transformed.apply_transform(transformation_icp)
+    return source_transformed
+
+
+def trimesh_to_open3d_point_cloud(trimesh):
+    point_cloud = o3d.geometry.PointCloud()
+    point_cloud.points = o3d.utility.Vector3dVector(trimesh.vertices)
+    return point_cloud
+
+
 def plot_meshes(meshes, colors=None, opacities=None, title=None):
     # Create a Pyvista plotter
     plotter = pv.Plotter()
@@ -277,34 +345,21 @@ if __name__ == "__main__":
                         opacities=[0.5, 0.5],
                         title="Raw models, post-centering")
 
+
+            model1_pc = trimesh_to_open3d_point_cloud(model1)
+            model2_pc = trimesh_to_open3d_point_cloud(model2)
+            model2_transformed = ransac_icp_registration(model1_pc, model2_pc)
+            plot_meshes([model1, model2_transformed], colors=['red', 'blue'],
+                        title="Aligned Models")
+            
             # pre-rotate model2
             ROT = -120.0
-            pre_rotate(model2, ROT)
-            plot_meshes([model1, model2], colors=['red', 'blue'], 
+            pre_rotate(model2_pc, ROT)
+            plot_meshes([model1_pc, model2_pc], colors=['red', 'blue'], 
                         title=f"Pre-rotated model 2 by {ROT} degrees")
-
-            # create sphere to select points of interest and point all three meshes
-            sphere_coord = np.array([-7, 11, 0])
-            radius = 4
-            sphere1 = trimesh.creation.icosphere(subdivisions=3, radius=radius)
-            sphere1.vertices += sphere_coord
-            sphere2 = trimesh.creation.icosphere(subdivisions=3, radius=radius)
-            sphere2.vertices -= sphere_coord
-            plot_meshes([model1, model2, sphere1, sphere2], 
-                        colors=['red', 'blue', 'green', 'yellow'], 
-                        title=f"AOI spheres, 1: {sphere_coord}, 2:{-sphere_coord}\nradius: {radius}")
-
-            # perform ICP registration
-            """ transformation_matrix, _ = icp_registration(model1, model2, center,
-                                                        radius, sampled=False) """
-            transformation_matrix, _ = icp_registration_with_two_spheres(model1, model2,
-                                                                         sphere_coord, radius,
-                                                                         -sphere_coord, radius,
-                                                                         sampled=False)
-            plot_meshes([model1, model2], colors=['red', 'blue'],
-                        title="Aligned Models")
-            combined_model = trimesh.util.concatenate(model1,
-                                                      model2)
+            
+            combined_model = trimesh.util.concatenate(model1_pc,
+                                                      model2_transformed)
 
             output_file_path = root_path / "aligned_scans" / f"{model1_name}_{model2_name}_aligned.stl"
             save_stl(combined_model, output_file_path)
