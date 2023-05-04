@@ -1,7 +1,5 @@
-import trimesh
-import os
 import numpy as np
-use_cuda = True
+use_cuda = False
 if use_cuda:
     import cupy as cp
     to_cpu = cp.asnumpy
@@ -9,6 +7,9 @@ if use_cuda:
 else:
     cp = np
     to_cpu = lambda x: x
+
+import trimesh
+import os
 import open3d as o3d
 import pyvista as pv
 import trimesh.transformations as tra
@@ -77,48 +78,33 @@ def decimate_mesh(mesh, fraction, n_jobs=8, max_iterations=100):
 
     return mesh
 
-def plot_meshes(meshes, colors=None, opacities=None, title=None):
+def plot_meshes_and_points(mesh_list, points_list=None, 
+                           mesh_colors=None, point_colors=None,
+                           opacities=None, title=None):
     # Create a Pyvista plotter
     plotter = pv.Plotter()
 
     # Set default colors and opacities if not provided
-    if colors is None:
-        colors = ['red', 'blue'] * len(meshes)
-    if opacities is None:
-        opacities = [0.9] * len(meshes)
-
-    # Convert Trimesh objects to Pyvista objects and add them to the plotter
-    for mesh, color, opacity in zip(meshes, colors, opacities):
-        pv_mesh = pv.wrap(mesh)
-        plotter.add_mesh(pv_mesh, color=color, opacity=opacity)
-
-    # Set the title
-    if title is not None:
-        plotter.add_text(title, font_size=20, name='title')
-
-    # Show the plot
-    plotter.show()
-
-def plot_points_and_meshes(points_list, meshes, point_colors=None, mesh_colors=None, opacities=None, title=None):
-    # Create a Pyvista plotter
-    plotter = pv.Plotter()
-
-    # Set default colors and opacities if not provided
-    if point_colors is None:
-        point_colors = ['green', 'yellow'] * len(points_list)
     if mesh_colors is None:
-        mesh_colors = ['red', 'blue'] * len(meshes)
+        mesh_colors = ['red', 'blue'] * len(mesh_list)
     if opacities is None:
-        opacities = [0.9] * len(meshes)
-
-    # Add the points to the plotter
-    for points, color in zip(points_list, point_colors):
-        plotter.add_mesh(pv.PolyData(points), color=color, point_size=5, render_points_as_spheres=True)
+        opacities = [0.9] * len(mesh_list)
 
     # Convert Trimesh objects to Pyvista objects and add them to the plotter
-    for mesh, color, opacity in zip(meshes, mesh_colors, opacities):
+    for mesh, color, opacity in zip(mesh_list, mesh_colors, opacities):
         pv_mesh = pv.wrap(mesh)
         plotter.add_mesh(pv_mesh, color=color, opacity=opacity)
+
+    # Add the points to the plotter if points_list is provided
+    if points_list is not None:
+        if point_colors is None:
+            point_colors = ['green', 'yellow'] * len(points_list)
+        
+        for points, color in zip(points_list, point_colors):
+            plotter.add_mesh(
+                pv.PolyData(points), color=color, point_size=5,
+                render_points_as_spheres=True
+            )
 
     # Set the title
     if title is not None:
@@ -134,82 +120,86 @@ def pre_rotate(mesh, angle):
     T = tra.rotation_matrix(np.radians(angle), [0, 0, 1])
     mesh.apply_transform(T)
 
-def create_cylinder(center, height, radius, num_segments=36):
+def sample_points_in_cylinders(mesh, cylinders, num_points, sampling_factor=3):
     """
-    Create a cylinder mesh centered at the given point.
-
-    Args:
-        center (numpy array): The center of the cylinder [x, y, z].
-        height (float): The height of the cylinder.
-        radius (float): The radius of the cylinder.
-        num_segments (int): The number of segments in the cylinder.
-
-    Returns:
-        A Trimesh object representing the cylinder.
-    """
-    cylinder = trimesh.creation.cylinder(height=height, radius=radius, 
-                                         sections=num_segments)
-    cylinder.vertices += center
-    return cylinder
-
-def sample_points_in_cylinder(mesh, center, height, radius, num_points):
-    """
-    Sample points from the surface of the mesh within a cylinder.
+    Sample points from the surface of the mesh within multiple cylinders.
 
     Args:
         mesh (trimesh.Trimesh): The input mesh.
-        center (list or numpy array): The center of the cylinder [x, y, z].
-        height (float): The height of the cylinder.
-        radius (float): The radius of the cylinder.
-        num_points (int): The number of points to sample.
+        cylinders (list of tuples): A list of cylinders, each defined by a tuple
+                                     (center, height, radius) where center is a
+                                     list or numpy array representing the center
+                                     of the cylinder [x, y, z], height is the
+                                     height of the cylinder, and radius is the
+                                     radius of the cylinder.
+        num_points (int): The total number of points to sample, distributed evenly
+                          among the cylinders.
+        sampling_factor (int): A multiplier for the number of points to sample
+                               initially from the mesh. A higher value increases
+                               the chance of finding points within cylinders.
 
     Returns:
-        A numpy array of shape (num_points, 3) containing the sampled points.
+        A numpy array of shape (num_points, 3) containing the sampled points
+        from the surface of the mesh within the specified cylinders.
     """
-    # Get all points on the surface of the mesh
-    all_points, _ = trimesh.sample.sample_surface(mesh, num_points * 10)
+    points = []
 
-    # Select points that are within the cylinder
-    distances_xy = np.linalg.norm(all_points[:, :2] - center[:2], axis=1)
-    z_differences = np.abs(all_points[:, 2] - center[2])
-    points_in_cylinder = all_points[(distances_xy <= radius) & (z_differences <= height / 2)]
+    # Get all points on the surface of the mesh
+    all_points, _ = trimesh.sample.sample_surface(mesh, num_points * sampling_factor)
+    combined_points = np.empty((0, 3))
+
+    # get all points within cylinders, not less that num_points
+    while combined_points.shape[0] < num_points:
+        for c in cylinders:
+            # Get the center, height, and radius of the cylinder
+            center, height, radius = c
+
+            # Select points that are within the cylinder
+            distances_xy = np.linalg.norm(all_points[:, :2] - center[:2], axis=1)
+            z_differences = np.abs(all_points[:, 2] - center[2])
+            points_in_cylinder = all_points[(distances_xy <= radius) & 
+                                            (z_differences <= height / 2)]
+
+            points.append(points_in_cylinder)
+
+        # Combine all points from all cylinders
+        combined_points = np.vstack(points)
+        sampling_factor += 1
 
     # Randomly select a subset of points if there are more points than needed
-    if points_in_cylinder.shape[0] > num_points:
-        indices = np.random.choice(points_in_cylinder.shape[0], num_points, replace=False)
-        points_in_cylinder = points_in_cylinder[indices]
+    if combined_points.shape[0] > num_points:
+        indices = np.random.choice(
+            combined_points.shape[0], num_points, replace=False
+        )
 
-    return points_in_cylinder
+        combined_points = combined_points[indices]
 
-def cpd_registration(source, center1, height1, radius1,
-                     target, center2, height2, radius2, 
+    return combined_points
+
+    
+def cpd_registration(source_mesh, target_mesh, cylinders,
                      samples, max_iterations=50, tolerance=1e-5,
                      use_cuda=use_cuda):
     """
     Perform Coherent Point Drift (CPD) registration on two point clouds.
 
     Args:
-        source (trimesh.mesh): Source mesh
-        target (trimesh.mesh): Target mesh
+        source_mesh (trimesh.mesh): Source mesh
+        target_mesh (trimesh.mesh): Target mesh
         max_iterations (int, optional): Maximum number of iterations. Default is 50.
         tolerance (float, optional): Tolerance for convergence. Default is 1e-5.
 
     Returns:
-        numpy.ndarray: The transformation matrix between the source and target point clouds.
+        numpy.ndarray: The transformation matrix between the source_mesh and target_mesh point clouds.
     """
-    target_points1 = sample_points_in_cylinder(target, center1, height1, radius1, samples // 2)
-    target_points2 = sample_points_in_cylinder(target, center2, height2, radius2, samples // 2)
-    target_points = np.vstack((target_points1, target_points2))
+    target_points_all = sample_points_in_cylinders(target_mesh, cylinders, samples)
+    source_points_all = sample_points_in_cylinders(source_mesh, cylinders, samples)
 
-    source_points1 = sample_points_in_cylinder(source, center1, height1, radius1, samples // 2)
-    source_points2 = sample_points_in_cylinder(source, center2, height2, radius2, samples // 2)
-    source_points = np.vstack((source_points1, source_points2))
-    
     # Convert numpy arrays to open3d point clouds
     source_pcd = o3d.geometry.PointCloud()
-    source_pcd.points = o3d.utility.Vector3dVector(source_points)
+    source_pcd.points = o3d.utility.Vector3dVector(source_points_all)
     target_pcd = o3d.geometry.PointCloud()
-    target_pcd.points = o3d.utility.Vector3dVector(target_points)
+    target_pcd.points = o3d.utility.Vector3dVector(target_points_all)
 
     # Perform CPD registration
     tf_param, _, _ = cpd.registration_cpd(
@@ -225,8 +215,12 @@ def cpd_registration(source, center1, height1, radius1,
 
     # Compose the transformation matrix
     transformation_matrix = np.eye(4)
-    transformation_matrix[:3, :3] = rotation_matrix.get()
-    transformation_matrix[:3, 3] = translation_vector.get()
+    if use_cuda:
+        transformation_matrix[:3, :3] = rotation_matrix.get()
+        transformation_matrix[:3, 3] = translation_vector.get()
+    else:
+        transformation_matrix[:3, :3] = rotation_matrix
+        transformation_matrix[:3, 3] = translation_vector
 
     # Return the transformation matrix
     return transformation_matrix
@@ -247,12 +241,17 @@ if __name__ == "__main__":
     print("3. Pre-rotate a model")
     user_input = input("Enter 1, 2, or 3: ")
 
+    root = Tk()
+    root.withdraw()
+    root.attributes("-top", 1)
+
     if user_input == "1":
         # ask user to select folder path using filedialog
-        root = Tk()
-        root.withdraw()
-        input_folder_path = filedialog.askdirectory(initialdir=raw_file_path,
-                                                    title="Select folder",)
+        input_folder_path = filedialog.askdirectory(
+            initialdir=raw_file_path,
+            title="Select folder"
+        )
+
         output_folder_path = desampled_scans_path
 
         # Set the fraction of faces to keep (e.g., 0.5 to keep half of the faces)
@@ -271,13 +270,12 @@ if __name__ == "__main__":
 
     elif user_input == "2":
         # Ask user to select two STL files using filedialog
-        root = Tk()
-        root.withdraw()
         input_file_paths = filedialog.askopenfilenames(
-                                            title="Select two STL files",
-                                            initialdir=desampled_scans_path,
-                                            filetypes=(("stl files", "*.stl"),),
-                                            multiple=True)
+            title="Select two STL files",
+            initialdir=desampled_scans_path,
+            filetypes=(("stl files", "*.stl"),),
+            multiple=True
+        )
 
         if len(input_file_paths) < 2:
             print(("Error: You selected less than 2 STL files."
@@ -286,79 +284,75 @@ if __name__ == "__main__":
             print(("Error: You selected more than 2 STL files."
                    " Please select exactly 2 STL files."))
         else:
-            model1_file_path = input_file_paths[0]
-            print(f"model 1 path: {model1_file_path}")
-            model1_name = split_path(model1_file_path)[1]
-            print(f"model 1 name: {model1_name}")
+            target_file_path = input_file_paths[0]
+            target_name = split_path(target_file_path)[1]
             model2_file_path = input_file_paths[1]
-            print(f"model 2 path: {model2_file_path}")
             model2_name = split_path(model2_file_path)[1]
-            print(f"model 2 name: {model2_name}")
 
             # load and visualized raw models, post-centering
-            model1 = load_stl(model1_file_path)
-            model2 = load_stl(model2_file_path)
-            # plot_meshes([model1, model2], colors=['red', 'blue'], 
-            #             title="Raw models")
+            target_mesh = load_stl(target_file_path)
+            source_mesh = load_stl(model2_file_path)
             
-            # pre-rotate model2 and visualize
+            # pre-rotate source_mesh and visualize
             ROT = -30.0
-            pre_rotate(model2, ROT)
-            plot_meshes([model1, model2], colors=['red', 'blue'], 
-                        title=f"Pre-rotated model 2 by {ROT} degrees")
+            pre_rotate(source_mesh, ROT)
+            plot_meshes_and_points(
+                mesh_list=[target_mesh, source_mesh],
+                title=(
+                    f"Pre-rotated source_mesh model by {ROT}"
+                    " degrees"
+                )
+            )
 
             # create boundary cylinder for targeted alignment and visualize
             cylinder_coords = np.array([4, 17, 0])
             height = 12
             radius = 6.5
+            cylinder_1 = [cylinder_coords, height, radius]
+            cylinder_2 = [-cylinder_coords, height, radius]
+            cylinders = (cylinder_1, cylinder_2)
             NUM_POINTS = 10000
             
             # Sample points within the cylinders
-            model1_points1 = sample_points_in_cylinder(model1, cylinder_coords,
-                                                       height, radius,
-                                                       num_points=NUM_POINTS//2)
-            model1_points2 = sample_points_in_cylinder(model1, -cylinder_coords,
-                                                       height, radius,
-                                                       num_points=NUM_POINTS//2)
-            model2_points1 = sample_points_in_cylinder(model2, cylinder_coords,
-                                                       height, radius,
-                                                       num_points=NUM_POINTS//2)
-            model2_points2 = sample_points_in_cylinder(model2, -cylinder_coords,
-                                                       height, radius,
-                                                       num_points=NUM_POINTS//2)
-            model1_points = np.concatenate((model1_points1, model1_points2))
-            model2_points = np.concatenate((model2_points1, model2_points2))
+            target_points_all = sample_points_in_cylinders(target_mesh, cylinders, NUM_POINTS)
+            source_points_all = sample_points_in_cylinders(source_mesh, cylinders, NUM_POINTS)
 
-            plot_points_and_meshes([model1_points, model2_points],
-                                   [model1, model2],
-                                    point_colors=['green', 'yellow'],
-                                    mesh_colors=['red', 'blue'],
-                                    title=(f"AOI cylinders, 1: {cylinder_coords}, "
-                                           f"2:{-cylinder_coords}\nheight: {height}, "
-                                           f"radius: {radius}"))
+            plot_meshes_and_points(
+                points_list=[target_points_all, source_points_all],
+                mesh_list=[target_mesh, source_mesh],
+                title=(
+                    f"AOI cylinders, 1: {cylinder_coords}, "
+                    f"2:{-cylinder_coords}\nheight: {height}, "
+                    f"radius: {radius}"
+                )
+            )
 
             # perform CPD registration and visualize
-            tran_matrix = cpd_registration(model2, cylinder_coords, height, radius,
-                                           model1, -cylinder_coords, height, radius,
-                                           samples=NUM_POINTS)
-            model2.apply_transform(tran_matrix)
-            plot_meshes([model1, model2], colors=['red', 'blue'],
-                        title="Aligned Models")
+            tran_matrix = cpd_registration(source_mesh, target_mesh, cylinders, samples=NUM_POINTS)
+            source_mesh.apply_transform(tran_matrix)
+            plot_meshes_and_points(
+                mesh_list=[target_mesh, source_mesh],
+                title= "Aligned Models"
+            )
             
             # combine and save models
-            combined_model = trimesh.util.concatenate(model1, model2)
+            combined_model = trimesh.util.concatenate(target_mesh, source_mesh)
     
-            output_file_path = (root_path / "aligned_scans" /
-                               f"{model1_name}_{model2_name}_aligned.stl")
+            output_file_path = (
+                root_path / "aligned_scans" / 
+                f"{target_name}_{model2_name}_aligned.stl"
+            )
+
             save_stl(combined_model, output_file_path)
 
     elif user_input == "3":
         # ask user to select file path using filedialog
-        root = Tk()
-        root.withdraw()
-        input_file_path = filedialog.askopenfilename(initialdir=desampled_scans_path,
-                                                    title="Select file", 
-                                                    filetypes=(("stl files", "*.stl"),))
+        input_file_path = filedialog.askopenfilename(
+            initialdir=desampled_scans_path,
+            title="Select file", 
+            filetypes=(("stl files", "*.stl"),)
+        )
+
         # Load the mesh from file
         mesh = trimesh.load(input_file_path)
 
