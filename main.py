@@ -13,14 +13,17 @@ import os
 import open3d as o3d
 import pyvista as pv
 import trimesh.transformations as tra
+import trimesh.boolean
 
 from tqdm import tqdm
 from pathlib import Path
 from tkinter import filedialog, Tk
 from joblib import Parallel, delayed
-from sklearn.decomposition import PCA
+from typing import List
 from trimesh import util
 from probreg import cpd
+from timeit import default_timer
+from concurrent.futures import ThreadPoolExecutor
 
 def split_path(file_path):
     """
@@ -46,9 +49,83 @@ def load_stl(file_path):
     Returns:
         A Trimesh object.
     """
+    start_time = default_timer()
+    _, name, _ = split_path(file_path)
     mesh = trimesh.load_mesh(file_path)
     mesh.vertices -= mesh.centroid
+    print((f"{name} loaded successfully "
+           f"in {round(default_timer()-start_time, 2)} secs")
+           )
     return mesh
+
+def create_cylinder(center, height, radius, segments=32):
+    cylinder = trimesh.creation.cylinder(radius, height, segments=segments)
+    cylinder.apply_translation(center - np.array([0, 0, height/2]))
+    return cylinder
+
+def mesh_within_cylinders_old(mesh, cylinders):
+    intersection_meshes = []
+
+    for info in cylinders:
+        center, height, radius = info
+        cylinder = create_cylinder(center, height, radius)
+        intersection = trimesh.boolean.intersection([mesh, cylinder], 
+                                                    engine='blender')
+        if not intersection.is_empty:
+            intersection_meshes.append(intersection)
+
+    if not intersection_meshes:
+        return None  # No intersections found
+
+    result_mesh = trimesh.util.concatenate(intersection_meshes)
+    return result_mesh
+
+
+
+def mesh_within_cylinders(mesh, cylinders):
+    intersection_meshes = []
+
+    def calculate_intersection(info):
+        center, height, radius = info
+        cylinder = create_cylinder(center, height, radius)
+        return trimesh.boolean.intersection([mesh, cylinder],
+                                            engine='blender')
+
+    with ThreadPoolExecutor() as executor:
+        intersections = executor.map(calculate_intersection, cylinders)
+
+    for intersection in intersections:
+        if not intersection.is_empty:
+            intersection_meshes.append(intersection)
+
+    if not intersection_meshes:
+        return None  # No intersections found
+
+    result_mesh = trimesh.util.concatenate(intersection_meshes)
+    return result_mesh
+
+
+
+def multi_decimate_mesh(mesh: trimesh.Trimesh, 
+                        target_resolutions: List[float]
+                        ) -> List[trimesh.Trimesh]:
+    """
+    Create downsampled versions of the input mesh at the specified resolutions.
+    
+    :param mesh: The input mesh to be downsampled.
+    :param target_resolutions: A list of target resolutions 
+                               for the downsampled meshes.
+    :return: A list of downsampled meshes.
+    """
+    
+    def downsample_mesh(resolution: float) -> trimesh.Trimesh:
+        return decimate_mesh(mesh, resolution)
+
+    downsampled_meshes = Parallel(n_jobs=4)(
+        delayed(downsample_mesh)(res) for res in target_resolutions
+    )
+    return downsampled_meshes
+
 
 def decimate_mesh(mesh, fraction, n_jobs=8, max_iterations=100):
     def create_lightweight_mesh(vertices, faces):
@@ -239,7 +316,9 @@ if __name__ == "__main__":
     print("1. Desampling a model")
     print("2. Performing a best fit of two models")
     print("3. Pre-rotate a model")
-    user_input = input("Enter 1, 2, or 3: ")
+    print("4. Iterative Downsampling Approach")
+    # user_input = input("Enter 1, 2, 3, or 4: ")
+    user_input = '4'
 
     root = Tk()
     root.withdraw()
@@ -362,6 +441,39 @@ if __name__ == "__main__":
         # Save the rotated mesh to file
         export_path = root_path / "pre-rotated_scans" / "rotated.stl"
         mesh.export(export_path)
+
+    elif user_input == "4":
+        # Get all STL files in the folder
+        stl_files = [f for f in Path(raw_file_path).glob("*.stl")]
+        print("Loading mesh files...")
+
+        # create boundary cylinder for targeted alignment and visualize
+        cylinder_coords = np.array([4, 17, 0])
+        height = 15
+        radius = 6.5
+        cylinder_1 = [cylinder_coords, height, radius]
+        cylinder_2 = [-cylinder_coords, height, radius]
+        cylinders = (cylinder_1, cylinder_2)
+        NUM_POINTS = 10000
+        SCAN_ANGLE = -30 # -ve or +ve depending on CW or CCW indexing
+        # -ve for CW looking down on sample, vice versa
+
+        # load and clip target mesh to prepare for downsampling
+        target_mesh = load_stl(stl_files[1])
+        target_mesh_clip = mesh_within_cylinders(mesh=target_mesh, 
+                                                 cylinders=cylinders)
+        del target_mesh # free up RAM
+        plot_meshes_and_points(mesh_list=[target_mesh_clip],
+                               title="Clipped Target Mesh")
+
+        # load, pre-rotate and clip source mesh to prepare for downsampling
+        source_mesh = load_stl(stl_files[0])
+        pre_rotate(source_mesh, SCAN_ANGLE)
+        source_mesh_clip = mesh_within_cylinders(mesh=source_mesh, 
+                                                 cylinders=cylinders)
+        del source_mesh # free up RAM
+        plot_meshes_and_points(mesh_list=[source_mesh_clip],
+                               title="Clipped Source Mesh")
 
     else:
         print("Invalid input")
